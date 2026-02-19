@@ -361,35 +361,72 @@ fn choose_message_text(message: &ClaudeWebRawMessage) -> String {
 }
 
 fn content_text(content: &serde_json::Value) -> Option<String> {
-    let blocks = content.as_array()?;
-    let mut pieces = Vec::new();
-    if blocks.len() > MAX_CONTENT_BLOCKS {
-        tracing::warn!(
-            "Claude.ai message content has {} block(s); reading first {}",
-            blocks.len(),
-            MAX_CONTENT_BLOCKS
-        );
-    }
-
-    for block in blocks.iter().take(MAX_CONTENT_BLOCKS) {
-        let kind = block
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let text = block
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-
-        if kind == "text" && !text.trim().is_empty() {
-            pieces.push(text.to_string());
+    match content {
+        serde_json::Value::String(text) => {
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(text.clone())
+            }
         }
-    }
+        serde_json::Value::Object(map) => {
+            if let Some(text) = map.get("text").and_then(|v| v.as_str())
+                && !text.trim().is_empty()
+            {
+                return Some(text.to_string());
+            }
 
-    if pieces.is_empty() {
-        None
-    } else {
-        Some(pieces.join("\n\n"))
+            // Some exports wrap message blocks under nested keys.
+            for key in ["content", "parts", "blocks"] {
+                if let Some(inner) = map.get(key)
+                    && let Some(text) = content_text(inner)
+                {
+                    return Some(text);
+                }
+            }
+
+            None
+        }
+        serde_json::Value::Array(blocks) => {
+            let mut pieces = Vec::new();
+            if blocks.len() > MAX_CONTENT_BLOCKS {
+                tracing::warn!(
+                    "Claude.ai message content has {} block(s); reading first {}",
+                    blocks.len(),
+                    MAX_CONTENT_BLOCKS
+                );
+            }
+
+            for block in blocks.iter().take(MAX_CONTENT_BLOCKS) {
+                if let Some(text) = block.as_str() {
+                    if !text.trim().is_empty() {
+                        pieces.push(text.to_string());
+                    }
+                    continue;
+                }
+
+                let kind = block
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let text = block
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+
+                // Some exports omit type for plain text blocks.
+                if (kind.is_empty() || kind == "text") && !text.trim().is_empty() {
+                    pieces.push(text.to_string());
+                }
+            }
+
+            if pieces.is_empty() {
+                None
+            } else {
+                Some(pieces.join("\n\n"))
+            }
+        }
+        _ => None,
     }
 }
 
@@ -421,7 +458,7 @@ fn content_types(content: &serde_json::Value) -> Vec<String> {
 }
 
 fn extracted_attachment_text(value: &serde_json::Value) -> Option<String> {
-    let items = value.as_array()?;
+    let items = attachment_items(value);
     if items.is_empty() {
         return None;
     }
@@ -454,10 +491,45 @@ fn extracted_attachment_text(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+fn attachment_items<'a>(value: &'a serde_json::Value) -> Vec<&'a serde_json::Value> {
+    if let Some(items) = value.as_array() {
+        return items.iter().collect();
+    }
+
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+
+    for key in ["attachments", "files", "items", "results", "data"] {
+        if let Some(items) = object.get(key).and_then(|v| v.as_array()) {
+            return items.iter().collect();
+        }
+    }
+
+    if object.contains_key("extracted_content") || object.contains_key("text") {
+        return vec![value];
+    }
+
+    Vec::new()
+}
+
 fn normalize_array(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Array(v) => serde_json::Value::Array(v),
         serde_json::Value::Null => serde_json::Value::Array(Vec::new()),
+        serde_json::Value::Object(map) => {
+            for key in ["attachments", "files", "items", "results", "data"] {
+                if let Some(serde_json::Value::Array(items)) = map.get(key) {
+                    return serde_json::Value::Array(items.clone());
+                }
+            }
+            if map.contains_key("extracted_content") || map.contains_key("text") {
+                return serde_json::Value::Array(vec![serde_json::Value::Object(map)]);
+            }
+
+            tracing::warn!("Expected array metadata field but got object value; coercing to []");
+            serde_json::Value::Array(Vec::new())
+        }
         _ => {
             tracing::warn!("Expected array metadata field but got non-array value; coercing to []");
             serde_json::Value::Array(Vec::new())
@@ -816,6 +888,77 @@ mod tests {
             conversations[0].messages[0].content,
             "from files extracted content"
         );
+    }
+
+    #[test]
+    fn reads_attachment_extracted_content_from_object_items_shape() {
+        let temp = tempdir().expect("tempdir");
+        let zip_path = temp.path().join("claude_export.zip");
+        let payload = r#"
+        [
+          {
+            "uuid": "att-obj-1",
+            "name": "Attachment object shape",
+            "chat_messages": [
+              {
+                "sender":"human",
+                "text":"",
+                "content":[{"type":"text","text":""}],
+                "attachments":{"items":[{"file_name":"paste.txt","extracted_content":"attachment object payload"}]},
+                "files":[]
+              }
+            ]
+          }
+        ]
+        "#;
+        write_zip_with_file(&zip_path, "conversations.json", payload);
+
+        let importer = ClaudeWebImporter;
+        let conversations = importer.parse(&zip_path).expect("parse");
+
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].messages.len(), 1);
+        assert_eq!(
+            conversations[0].messages[0].content,
+            "attachment object payload"
+        );
+        assert_eq!(
+            conversations[0].messages[0]
+                .source_metadata
+                .get("attachments")
+                .and_then(|v| v.as_array())
+                .map(|v| v.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn reads_content_text_from_object_shape_when_text_is_empty() {
+        let temp = tempdir().expect("tempdir");
+        let zip_path = temp.path().join("claude_export.zip");
+        let payload = r#"
+        [
+          {
+            "uuid": "content-obj-1",
+            "name": "Content object shape",
+            "chat_messages": [
+              {
+                "sender":"assistant",
+                "text":"",
+                "content":{"type":"text","text":"content object text"}
+              }
+            ]
+          }
+        ]
+        "#;
+        write_zip_with_file(&zip_path, "conversations.json", payload);
+
+        let importer = ClaudeWebImporter;
+        let conversations = importer.parse(&zip_path).expect("parse");
+
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].messages.len(), 1);
+        assert_eq!(conversations[0].messages[0].content, "content object text");
     }
 
     fn write_zip_with_file(path: &std::path::Path, name: &str, content: &str) {

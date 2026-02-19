@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
+use std::fmt::Write as _;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
@@ -121,6 +122,14 @@ pub struct ImportCommonArgs {
     #[arg(long)]
     user: Option<String>,
 
+    /// Skip indexing imported conversations into workspace memory (`memory_search`)
+    #[arg(long)]
+    no_index_memory: bool,
+
+    /// Index to workspace memory only (skip conversation/thread import)
+    #[arg(long)]
+    index_only: bool,
+
     /// Legacy flag (no-op): checkpointing is now enabled by default
     #[arg(long, hide = true)]
     resume: bool,
@@ -166,7 +175,24 @@ struct ConversationImportOutcome {
     skipped_empty: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ImportExecutionMode {
+    import_conversations: bool,
+    index_memory: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MemoryIndexOutcome {
+    indexed_messages: usize,
+    already_indexed: bool,
+    skipped_empty: bool,
+}
+
 const IMPORT_CHECKPOINT_VERSION: u32 = 1;
+const IMPORT_MEMORY_DOC_MAX_CHARS: usize = 500_000;
+const IMPORT_MEMORY_MESSAGE_MAX_CHARS: usize = 20_000;
+const IMPORT_MEMORY_SOURCE_SLUG_MAX_CHARS: usize = 64;
+const IMPORT_MEMORY_SOURCE_HASH_PREFIX_CHARS: usize = 12;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ImportCheckpointState {
@@ -450,6 +476,22 @@ pub async fn run_import_command(cmd: ImportCommand, no_db: bool) -> anyhow::Resu
     }
 }
 
+fn resolve_import_execution_mode(
+    index_only: bool,
+    no_index_memory: bool,
+) -> anyhow::Result<ImportExecutionMode> {
+    let mode = ImportExecutionMode {
+        import_conversations: !index_only,
+        index_memory: !no_index_memory,
+    };
+
+    if !mode.import_conversations && !mode.index_memory {
+        anyhow::bail!("--index-only cannot be combined with --no-index-memory.");
+    }
+
+    Ok(mode)
+}
+
 async fn run_import_flow(
     importer: impl Importer,
     path: PathBuf,
@@ -460,6 +502,8 @@ async fn run_import_flow(
         dry_run,
         channel,
         user,
+        no_index_memory,
+        index_only,
         resume: resume_compat,
         no_checkpoint,
         fresh,
@@ -469,10 +513,20 @@ async fn run_import_flow(
 
     let source_key = importer.source_key().to_string();
     let source_name = importer.source_name().to_string();
+    let execution_mode = resolve_import_execution_mode(index_only, no_index_memory)?;
 
     if dry_run {
-        if no_checkpoint || fresh || checkpoint.is_some() || cleanup_checkpoint || resume_compat {
-            println!("Note: checkpoint options are ignored in --dry-run mode.");
+        if no_checkpoint
+            || fresh
+            || checkpoint.is_some()
+            || cleanup_checkpoint
+            || resume_compat
+            || index_only
+            || no_index_memory
+        {
+            println!(
+                "Note: write-related options (--resume/--checkpoint/--fresh/--cleanup-checkpoint/--index-only/--no-index-memory) are ignored in --dry-run mode."
+            );
         }
         let summary = importer
             .parse_stream(&path, |_conversation| Ok(()))
@@ -484,6 +538,10 @@ async fn run_import_flow(
             summary.parsed_messages,
             source_name,
             path.display()
+        );
+        println!(
+            "Import mode: conversations={} memory_index={}",
+            execution_mode.import_conversations, execution_mode.index_memory
         );
         println!("Dry run enabled: no database writes performed.");
         return Ok(());
@@ -519,6 +577,10 @@ async fn run_import_flow(
     let db = crate::db::connect_from_config(&config.database)
         .await
         .map_err(|e| anyhow::anyhow!("database connection failed: {}", e))?;
+    let import_workspace = Arc::new(crate::workspace::Workspace::new_with_db(
+        target_user.clone(),
+        db.clone(),
+    ));
 
     if resume_compat {
         println!("Note: --resume is now a no-op; checkpointing is enabled by default.");
@@ -575,6 +637,10 @@ async fn run_import_flow(
     println!("Importing from {}:", source_name);
     println!("  Path: {}", path.display());
     println!("  Target: channel={} user={}", channel, target_user);
+    println!(
+        "  Mode: conversations={} memory_index={}",
+        execution_mode.import_conversations, execution_mode.index_memory
+    );
 
     let mut stats = ImportStats::default();
     let runtime_handle = tokio::runtime::Handle::current();
@@ -655,6 +721,22 @@ async fn run_import_flow(
         if let Some(checkpoint) = checkpoint.as_ref()
             && checkpoint.contains(source_id.as_str())
         {
+            if execution_mode.index_memory {
+                if let Err(e) = tokio::task::block_in_place(|| {
+                    runtime_handle.block_on(ensure_imported_conversation_memory_index(
+                        import_workspace.as_ref(),
+                        source_key_owned.as_str(),
+                        source_name.as_str(),
+                        &conversation,
+                    ))
+                }) {
+                    tracing::warn!(
+                        "Failed to backfill memory index for checkpointed conversation {}: {}",
+                        source_id,
+                        e
+                    );
+                }
+            }
             stats.skipped_checkpoint += 1;
             render_progress(&stats, false);
             return Ok(());
@@ -663,11 +745,13 @@ async fn run_import_flow(
         let outcome = tokio::task::block_in_place(|| {
             runtime_handle.block_on(persist_imported_conversation(
                 db.clone(),
+                import_workspace.clone(),
                 source_key_owned.as_str(),
                 source_name.as_str(),
                 channel_owned.as_str(),
                 user_owned.as_str(),
                 conversation,
+                execution_mode,
             ))
         })
         .map_err(|e| {
@@ -758,12 +842,49 @@ async fn run_import_flow(
 
 async fn persist_imported_conversation(
     db: Arc<dyn Database>,
+    import_workspace: Arc<crate::workspace::Workspace>,
     source_key: &str,
     source_name: &str,
     channel: &str,
     user_id: &str,
     conversation: ImportedConversation,
+    mode: ImportExecutionMode,
 ) -> anyhow::Result<ConversationImportOutcome> {
+    if !mode.import_conversations {
+        let memory_outcome = if mode.index_memory {
+            ensure_imported_conversation_memory_index(
+                import_workspace.as_ref(),
+                source_key,
+                source_name,
+                &conversation,
+            )
+            .await?
+        } else {
+            MemoryIndexOutcome::default()
+        };
+
+        if memory_outcome.skipped_empty {
+            return Ok(ConversationImportOutcome {
+                imported_messages: 0,
+                skipped_duplicate: false,
+                skipped_empty: true,
+            });
+        }
+        if memory_outcome.already_indexed {
+            return Ok(ConversationImportOutcome {
+                imported_messages: 0,
+                skipped_duplicate: true,
+                skipped_empty: false,
+            });
+        }
+
+        return Ok(ConversationImportOutcome {
+            imported_messages: memory_outcome.indexed_messages,
+            skipped_duplicate: false,
+            skipped_empty: false,
+        });
+    }
+
     let existing = db
         .find_conversation_by_import_source(
             user_id,
@@ -787,6 +908,21 @@ async fn persist_imported_conversation(
             );
             db.delete_conversation(existing_id).await?;
         } else {
+            if mode.index_memory
+                && let Err(e) = ensure_imported_conversation_memory_index(
+                    import_workspace.as_ref(),
+                    source_key,
+                    source_name,
+                    &conversation,
+                )
+                .await
+            {
+                tracing::warn!(
+                    "Failed to index duplicate imported conversation {} into workspace memory: {}",
+                    conversation.source_id,
+                    e
+                );
+            }
             return Ok(ConversationImportOutcome {
                 imported_messages: 0,
                 skipped_duplicate: true,
@@ -880,8 +1016,8 @@ async fn persist_imported_conversation(
         imported_messages += 1;
     }
 
-    let started_at = conversation.started_at.or(first_msg_ts);
-    let last_activity = conversation.updated_at.or(last_msg_ts);
+    let started_at = conversation.started_at.as_ref().cloned().or(first_msg_ts);
+    let last_activity = conversation.updated_at.as_ref().cloned().or(last_msg_ts);
     db.set_conversation_time_bounds(conversation_id, started_at, last_activity)
         .await?;
 
@@ -902,6 +1038,22 @@ async fn persist_imported_conversation(
     db.update_conversation_metadata_field(conversation_id, "import", &import_metadata)
         .await?;
 
+    if mode.index_memory
+        && let Err(e) = ensure_imported_conversation_memory_index(
+            import_workspace.as_ref(),
+            source_key,
+            source_name,
+            &conversation,
+        )
+        .await
+    {
+        tracing::warn!(
+            "Failed to index imported conversation {} into workspace memory: {}",
+            conversation.source_id,
+            e
+        );
+    }
+
     Ok(ConversationImportOutcome {
         imported_messages,
         skipped_duplicate: false,
@@ -911,6 +1063,183 @@ async fn persist_imported_conversation(
 
 fn import_state_from_metadata(metadata: &serde_json::Value) -> Option<&str> {
     metadata.get("import")?.get("state")?.as_str()
+}
+
+async fn ensure_imported_conversation_memory_index(
+    workspace: &crate::workspace::Workspace,
+    source_key: &str,
+    source_name: &str,
+    conversation: &ImportedConversation,
+) -> Result<MemoryIndexOutcome, crate::error::WorkspaceError> {
+    let indexed_messages = conversation
+        .messages
+        .iter()
+        .filter(|m| !m.content.trim().is_empty())
+        .count();
+    if indexed_messages == 0 {
+        return Ok(MemoryIndexOutcome {
+            indexed_messages: 0,
+            already_indexed: false,
+            skipped_empty: true,
+        });
+    }
+
+    let path = import_workspace_document_path(source_key, conversation.source_id.as_str());
+    if workspace.exists(path.as_str()).await? {
+        return Ok(MemoryIndexOutcome {
+            indexed_messages,
+            already_indexed: true,
+            skipped_empty: false,
+        });
+    }
+
+    let content = build_import_workspace_document(source_name, source_key, conversation);
+    workspace.write(path.as_str(), content.as_str()).await?;
+    Ok(MemoryIndexOutcome {
+        indexed_messages,
+        already_indexed: false,
+        skipped_empty: false,
+    })
+}
+
+fn import_workspace_document_path(source_key: &str, source_id: &str) -> String {
+    let source_slug = slugify_import_source_id(source_id, IMPORT_MEMORY_SOURCE_SLUG_MAX_CHARS);
+    let hash = blake3::hash(source_id.as_bytes()).to_hex().to_string();
+    let hash_prefix: String = hash
+        .chars()
+        .take(IMPORT_MEMORY_SOURCE_HASH_PREFIX_CHARS)
+        .collect();
+
+    format!("imports/{source_key}/{source_slug}-{hash_prefix}.md")
+}
+
+fn slugify_import_source_id(source_id: &str, max_chars: usize) -> String {
+    let mut slug = String::new();
+    let mut chars_added = 0_usize;
+    let mut last_was_dash = false;
+
+    for ch in source_id.chars() {
+        if chars_added >= max_chars {
+            break;
+        }
+
+        let mapped = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else if matches!(ch, '-' | '_' | '.') {
+            ch
+        } else {
+            '-'
+        };
+
+        if mapped == '-' {
+            if slug.is_empty() || last_was_dash {
+                continue;
+            }
+            last_was_dash = true;
+        } else {
+            last_was_dash = false;
+        }
+
+        slug.push(mapped);
+        chars_added += 1;
+    }
+
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+
+    if slug.is_empty() {
+        return "conversation".to_string();
+    }
+
+    slug
+}
+
+fn build_import_workspace_document(
+    source_name: &str,
+    source_key: &str,
+    conversation: &ImportedConversation,
+) -> String {
+    let title = conversation
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("Imported Conversation");
+
+    let mut document = String::new();
+    let _ = writeln!(document, "# {title}");
+    let _ = writeln!(document);
+    let _ = writeln!(document, "- Source: {source_name} ({source_key})");
+    let _ = writeln!(
+        document,
+        "- Source Conversation ID: {}",
+        conversation.source_id
+    );
+    if let Some(started_at) = conversation.started_at.as_ref() {
+        let _ = writeln!(document, "- Started At: {}", started_at.to_rfc3339());
+    }
+    if let Some(updated_at) = conversation.updated_at.as_ref() {
+        let _ = writeln!(document, "- Updated At: {}", updated_at.to_rfc3339());
+    }
+    let _ = writeln!(document);
+    let _ = writeln!(document, "## Messages");
+    let _ = writeln!(document);
+
+    let total_non_empty_messages = conversation
+        .messages
+        .iter()
+        .filter(|m| !m.content.trim().is_empty())
+        .count();
+    let mut indexed_non_empty_messages = 0_usize;
+
+    for message in &conversation.messages {
+        let content = message.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+
+        let role_label = match message.role.as_str() {
+            "user" => "User",
+            "assistant" => "Assistant",
+            _ => "Message",
+        };
+        let timestamp = message
+            .timestamp
+            .as_ref()
+            .map(|v| v.to_rfc3339())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let was_truncated = content.chars().count() > IMPORT_MEMORY_MESSAGE_MAX_CHARS;
+        let mut indexed_content = if was_truncated {
+            truncate_chars(content, IMPORT_MEMORY_MESSAGE_MAX_CHARS)
+        } else {
+            content.to_string()
+        };
+        if was_truncated {
+            indexed_content.push_str("\n\n[message truncated for indexing]");
+        }
+
+        let mut section = String::new();
+        let _ = writeln!(section, "### {role_label} [{timestamp}]");
+        let _ = writeln!(section, "{indexed_content}");
+        let _ = writeln!(section);
+
+        if document.len() + section.len() > IMPORT_MEMORY_DOC_MAX_CHARS {
+            let omitted = total_non_empty_messages.saturating_sub(indexed_non_empty_messages);
+            let _ = writeln!(
+                document,
+                "_{} message(s) omitted due to indexing size limits._",
+                omitted
+            );
+            break;
+        }
+
+        document.push_str(section.as_str());
+        indexed_non_empty_messages += 1;
+    }
+
+    document
 }
 
 pub(crate) fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
@@ -954,8 +1283,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ImportCheckpoint, default_checkpoint_path, import_state_from_metadata,
-        load_processed_source_ids, remove_checkpoint_files,
+        ImportCheckpoint, ImportedConversation, ImportedMessage, build_import_workspace_document,
+        default_checkpoint_path, import_state_from_metadata, import_workspace_document_path,
+        load_processed_source_ids, remove_checkpoint_files, resolve_import_execution_mode,
     };
 
     #[test]
@@ -1180,5 +1510,102 @@ mod tests {
             "thread_type": "thread"
         });
         assert_eq!(import_state_from_metadata(&metadata), None);
+    }
+
+    #[test]
+    fn import_workspace_document_path_is_stable_and_sanitized() {
+        let source_id = "Abc 123/Conversation?.jsonl";
+        let first = import_workspace_document_path("claude_code", source_id);
+        let second = import_workspace_document_path("claude_code", source_id);
+        assert_eq!(first, second);
+        assert!(first.starts_with("imports/claude_code/"));
+        assert!(first.ends_with(".md"));
+        let suffix = first.trim_start_matches("imports/claude_code/");
+        assert!(!suffix.contains('/'));
+        assert!(suffix.contains('-'));
+    }
+
+    #[test]
+    fn build_import_workspace_document_includes_metadata_and_messages() {
+        let conversation = ImportedConversation {
+            source_id: "source-123".to_string(),
+            title: Some("Rust Serialization Trait Errors".to_string()),
+            started_at: Some(
+                chrono::DateTime::parse_from_rfc3339("2025-01-15T10:00:00.000Z")
+                    .expect("parse timestamp")
+                    .with_timezone(&chrono::Utc),
+            ),
+            updated_at: Some(
+                chrono::DateTime::parse_from_rfc3339("2025-01-15T10:30:00.000Z")
+                    .expect("parse timestamp")
+                    .with_timezone(&chrono::Utc),
+            ),
+            messages: vec![
+                ImportedMessage {
+                    role: "user".to_string(),
+                    content: "Can you explain lifetimes?".to_string(),
+                    timestamp: None,
+                    source_metadata: serde_json::Value::Null,
+                },
+                ImportedMessage {
+                    role: "assistant".to_string(),
+                    content: "Lifetimes in Rust are...".to_string(),
+                    timestamp: None,
+                    source_metadata: serde_json::Value::Null,
+                },
+            ],
+            source_metadata: serde_json::Value::Null,
+        };
+
+        let doc = build_import_workspace_document("Claude.ai", "claude_web", &conversation);
+        assert!(doc.contains("# Rust Serialization Trait Errors"));
+        assert!(doc.contains("Source Conversation ID: source-123"));
+        assert!(doc.contains("### User [unknown]"));
+        assert!(doc.contains("### Assistant [unknown]"));
+        assert!(doc.contains("Lifetimes in Rust are..."));
+    }
+
+    #[test]
+    fn build_import_workspace_document_truncates_large_messages_for_indexing() {
+        let oversized = "x".repeat(25_000);
+        let conversation = ImportedConversation {
+            source_id: "source-oversized".to_string(),
+            title: Some("Oversized".to_string()),
+            started_at: None,
+            updated_at: None,
+            messages: vec![ImportedMessage {
+                role: "assistant".to_string(),
+                content: oversized,
+                timestamp: None,
+                source_metadata: serde_json::Value::Null,
+            }],
+            source_metadata: serde_json::Value::Null,
+        };
+
+        let doc = build_import_workspace_document("Claude.ai", "claude_web", &conversation);
+        assert!(doc.contains("[message truncated for indexing]"));
+    }
+
+    #[test]
+    fn resolve_import_execution_mode_defaults_to_dual_write() {
+        let mode = resolve_import_execution_mode(false, false).expect("mode");
+        assert!(mode.import_conversations);
+        assert!(mode.index_memory);
+    }
+
+    #[test]
+    fn resolve_import_execution_mode_supports_index_only() {
+        let mode = resolve_import_execution_mode(true, false).expect("mode");
+        assert!(!mode.import_conversations);
+        assert!(mode.index_memory);
+    }
+
+    #[test]
+    fn resolve_import_execution_mode_rejects_no_outputs() {
+        let err = resolve_import_execution_mode(true, true).expect_err("expected error");
+        assert!(
+            err.to_string()
+                .contains("--index-only cannot be combined with --no-index-memory")
+        );
     }
 }
