@@ -9,7 +9,7 @@ use async_trait::async_trait;
 
 use crate::context::JobContext;
 use crate::extensions::{ExtensionKind, ExtensionManager};
-use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
+use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput, require_str};
 
 // ── tool_search ──────────────────────────────────────────────────────────
 
@@ -30,7 +30,7 @@ impl Tool for ToolSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search for available extensions (MCP servers, WASM tools) to add. \
+        "Search for available extensions (MCP servers, WASM tools, WASM channels) to add. \
          Use discover:true to search online if the built-in registry has no results."
     }
 
@@ -100,7 +100,7 @@ impl Tool for ToolInstallTool {
     }
 
     fn description(&self) -> &str {
-        "Install an extension (MCP server or WASM tool). \
+        "Install an extension (MCP server, WASM tool, or WASM channel). \
          Use the name from tool_search results, or provide an explicit URL."
     }
 
@@ -118,7 +118,7 @@ impl Tool for ToolInstallTool {
                 },
                 "kind": {
                     "type": "string",
-                    "enum": ["mcp_server", "wasm_tool"],
+                    "enum": ["mcp_server", "wasm_tool", "wasm_channel"],
                     "description": "Extension type (auto-detected if omitted)"
                 }
             },
@@ -143,6 +143,7 @@ impl Tool for ToolInstallTool {
             .and_then(|k| match k {
                 "mcp_server" => Some(ExtensionKind::McpServer),
                 "wasm_tool" => Some(ExtensionKind::WasmTool),
+                "wasm_channel" => Some(ExtensionKind::WasmChannel),
                 _ => None,
             });
 
@@ -158,8 +159,8 @@ impl Tool for ToolInstallTool {
         Ok(ToolOutput::success(output, start.elapsed()))
     }
 
-    fn requires_approval(&self) -> bool {
-        true
+    fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+        ApprovalRequirement::UnlessAutoApproved
     }
 }
 
@@ -253,8 +254,8 @@ impl Tool for ToolAuthTool {
         Ok(ToolOutput::success(output, start.elapsed()))
     }
 
-    fn requires_approval(&self) -> bool {
-        true
+    fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+        ApprovalRequirement::UnlessAutoApproved
     }
 }
 
@@ -478,8 +479,8 @@ impl Tool for ToolRemoveTool {
         Ok(ToolOutput::success(output, start.elapsed()))
     }
 
-    fn requires_approval(&self) -> bool {
-        true
+    fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+        ApprovalRequirement::UnlessAutoApproved
     }
 }
 
@@ -500,11 +501,15 @@ mod tests {
 
     #[test]
     fn test_tool_install_schema() {
+        use crate::tools::tool::ApprovalRequirement;
         let tool = ToolInstallTool {
             manager: test_manager_stub(),
         };
         assert_eq!(tool.name(), "tool_install");
-        assert!(tool.requires_approval());
+        assert_eq!(
+            tool.requires_approval(&serde_json::json!({})),
+            ApprovalRequirement::UnlessAutoApproved
+        );
         let schema = tool.parameters_schema();
         assert!(schema["properties"].get("name").is_some());
         assert!(schema["properties"].get("url").is_some());
@@ -512,11 +517,15 @@ mod tests {
 
     #[test]
     fn test_tool_auth_schema() {
+        use crate::tools::tool::ApprovalRequirement;
         let tool = ToolAuthTool {
             manager: test_manager_stub(),
         };
         assert_eq!(tool.name(), "tool_auth");
-        assert!(tool.requires_approval());
+        assert_eq!(
+            tool.requires_approval(&serde_json::json!({})),
+            ApprovalRequirement::UnlessAutoApproved
+        );
         let schema = tool.parameters_schema();
         assert!(schema["properties"].get("name").is_some());
         // token param must NOT be in schema (security: tokens never go through LLM)
@@ -528,31 +537,43 @@ mod tests {
 
     #[test]
     fn test_tool_activate_schema() {
+        use crate::tools::tool::ApprovalRequirement;
         let tool = ToolActivateTool {
             manager: test_manager_stub(),
         };
         assert_eq!(tool.name(), "tool_activate");
-        assert!(!tool.requires_approval());
+        assert_eq!(
+            tool.requires_approval(&serde_json::json!({})),
+            ApprovalRequirement::Never
+        );
     }
 
     #[test]
     fn test_tool_list_schema() {
+        use crate::tools::tool::ApprovalRequirement;
         let tool = ToolListTool {
             manager: test_manager_stub(),
         };
         assert_eq!(tool.name(), "tool_list");
-        assert!(!tool.requires_approval());
+        assert_eq!(
+            tool.requires_approval(&serde_json::json!({})),
+            ApprovalRequirement::Never
+        );
         let schema = tool.parameters_schema();
         assert!(schema["properties"].get("kind").is_some());
     }
 
     #[test]
     fn test_tool_remove_schema() {
+        use crate::tools::tool::ApprovalRequirement;
         let tool = ToolRemoveTool {
             manager: test_manager_stub(),
         };
         assert_eq!(tool.name(), "tool_remove");
-        assert!(tool.requires_approval());
+        assert_eq!(
+            tool.requires_approval(&serde_json::json!({})),
+            ApprovalRequirement::UnlessAutoApproved
+        );
     }
 
     /// Create a stub manager for schema tests (these don't call execute).
@@ -570,11 +591,13 @@ mod tests {
             Arc::new(InMemorySecretsStore::new(crypto)),
             Arc::new(ToolRegistry::new()),
             None,
+            None,
             std::path::PathBuf::from("/tmp/ironclaw-test-tools"),
             std::path::PathBuf::from("/tmp/ironclaw-test-channels"),
             None,
             "test".to_string(),
             None,
+            Vec::new(),
         ))
     }
 }
